@@ -5,14 +5,26 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 from flask_migrate import Migrate
 from flask_cors import CORS
+import boto3
+import base64
+import json
 
 app = Flask(__name__)
 # app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://root:root@localhost:3306/userdb'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///userdb.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'MY_SECRET_KEY'
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 7200
 
 CORS(app, resources={r"/*": {"origins": "http://localhost:3000", "methods": ["GET", "POST", "DELETE"]}})
+
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id='AKIA2NK3YJGVJGFXUQEY',
+    aws_secret_access_key='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',
+    region_name='us-east-1'
+)
+
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
@@ -32,9 +44,13 @@ class User(db.Model):
 
 class UserFile(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    file_name = db.Column(db.String(256), unique=True, nullable=False)
-    file_id = db.Column(db.String(256), nullable=False)
+    userId = db.Column(db.Integer, nullable=False)
+    file_name = db.Column(db.String(256), nullable=True)
+    file_id = db.Column(db.String(256), nullable=True)
     flow_type = db.Column(db.String(256), nullable=True)
+    race_season = db.Column(db.String(256), nullable=False)
+    car_name = db.Column(db.String(256), nullable=True)
+    car_model = db.Column(db.String(256), nullable=True)
     json_data = db.Column(db.JSON, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -49,6 +65,7 @@ with app.app_context():
 def signup():
     email = request.json.get('email')
     password = request.json.get('password')
+    name = request.json.get('userName')
 
     if not email or not password:
         return jsonify({"msg": "Email and password are required"}), 400
@@ -57,7 +74,7 @@ def signup():
         return jsonify({"msg": "Email already exists"}), 400
 
     hashed_password = generate_password_hash(password, method='pbkdf2:sha256')
-    new_user = User(email=email, password=hashed_password, role='USER')
+    new_user = User(email=email, password=hashed_password, role='USER', name=name)
 
     db.session.add(new_user)
     db.session.commit()
@@ -70,16 +87,173 @@ def login():
 
     user = User.query.filter_by(email=email).first()
     if user and check_password_hash(user.password, password):
-        access_token = create_access_token(identity={'email': email})
+        access_token = create_access_token(identity={'userId': user.id})
         return jsonify(access_token=access_token), 200
 
     return jsonify({"msg": "Invalid email or password"}), 401
 
-@app.route('/protected', methods=['GET'])
+@app.route('/presign/url', methods=['POST'])
 @jwt_required()
 def protected():
     current_user = get_jwt_identity()
-    return jsonify({"msg": "This is a protected route", "name": current_user['email']}), 200
+    fileName = request.json.get('fileName')
+    fileSize = request.json.get('fileSize')
+    fileType = request.json.get('fileType')
+
+    if not fileName and not fileSize and not fileType:
+        return jsonify({"msg": "File type, file size, and file name are required"}), 400
+
+    if not fileName.endswith('.json'):
+        return jsonify({"msg": "Only JSON file type is supported"}), 400
+
+    if fileType != 'application/json':
+        return jsonify({"msg": "Only JSON file type is supported"}), 400
+
+    try:
+        presigned_url = s3_client.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': 'race-vehicle-file',
+                'Key': base64.b64encode(str(current_user['userId']).encode('utf-8')).decode('utf-8') + '/' + fileName,
+                'ContentType': fileType,
+                'ContentLength': isinstance(fileSize, int) if fileSize else int(value),
+                'Metadata': {
+                    'file_name': fileName
+                }
+            },
+            ExpiresIn=300,
+            HttpMethod='PUT'
+        )
+        
+        return jsonify({"presigned_url": presigned_url}), 200
+    except Exception as e:
+        print(str(e))
+        return jsonify({"errorMsg": 'Something went wrong please try again later..!'}), 500
+
+@app.route('/upload/data', methods=['POST'])
+@jwt_required()
+def listBuckets():
+    current_user = get_jwt_identity()
+    
+    flowType = request.json.get('flowType')
+
+    if not flowType:
+        return jsonify({"msg": "Flow type is required"}), 400
+
+    raceSeason = request.json.get('raceSeason')
+    carName = request.json.get('carName')
+    carModel = request.json.get('carModel')
+
+    if not raceSeason:
+        return jsonify({"msg": "Race season are required"}), 400
+    
+    if flowType == 'FILE':
+        fileName = request.json.get('fileName')
+        fileId = request.json.get('fileId')
+
+        if not fileName.endswith('.json'):
+            return jsonify({"msg": "Only JSON file type is supported"}), 400
+
+        try:
+            response = s3_client.get_object(
+                Bucket='race-vehicle-file',
+                Key=base64.b64encode(str(current_user['userId']).encode('utf-8')).decode('utf-8') + '/' + fileName,
+                VersionId=fileId
+            )    
+
+            data = json.loads(response['Body'].read().decode('utf-8'))
+            new_user_file = UserFile(userId=current_user['userId'], file_name=fileName, file_id=fileId, flow_type=flowType, race_season=raceSeason, car_name=carName, car_model=carModel, json_data=data)
+            db.session.add(new_user_file)
+            db.session.commit()
+            
+            return jsonify({"msg": "Data Saved Successfully"}), 200
+        
+        except Exception as e:
+            print(str(e))
+            return jsonify({"msg": "Failed", "error": str(e)}), 400
+
+    elif flowType == 'MANUAL':
+        jsonData = request.json.get('jsonData')
+
+        new_user_file = UserFile(userId=current_user['userId'], flow_type=flowType, race_season=raceSeason, car_name=carName, car_model=carModel, json_data=jsonData)
+        db.session.add(new_user_file)
+        db.session.commit()
+
+        return jsonify({"msg": "Data Saved Successfully"}), 200
+
+    else:
+        return jsonify({"msg": "Invalid flow type"}), 400
+
+@app.route('/all/races', methods=['GET'])
+@jwt_required()
+def getAllRaces():
+    current_user = get_jwt_identity()
+    
+    query = UserFile.query.with_entities(
+        UserFile.id, UserFile.userId, UserFile.file_name, UserFile.file_id, 
+        UserFile.flow_type, UserFile.race_season, 
+        UserFile.car_name, UserFile.car_model,
+        UserFile.created_at, UserFile.updated_at
+    )
+    
+    query = query.filter(UserFile.userId == current_user['userId'])
+    user_files = query.all()
+    
+    files_list = []
+
+    for file in user_files:
+        files_list.append({
+            'id': file.id,
+            'userId': file.userId,
+            'file_name': file.file_name,
+            'file_id': file.file_id,
+            'flow_type': file.flow_type,
+            'race_season': file.race_season,
+            'car_name': file.car_name,
+            'car_model': file.car_model,
+            'created_at': file.created_at,
+            'updated_at': file.updated_at
+        })
+
+    return jsonify(files_list), 200
+
+@app.route('/race/<int:raceId>', methods=['GET'])
+@jwt_required()
+def getRace(raceId):
+    current_user = get_jwt_identity()
+
+    query = UserFile.query.with_entities(
+        UserFile.id, UserFile.userId, UserFile.file_name, UserFile.file_id, 
+        UserFile.flow_type, UserFile.race_season, 
+        UserFile.car_name, UserFile.car_model, UserFile.json_data,
+        UserFile.created_at, UserFile.updated_at
+    )
+
+    if not raceId:
+        return jsonify({"msg": "Race ID is required"}), 400
+    
+    query = query.filter(UserFile.id == raceId).filter(UserFile.userId == current_user['userId'])
+    user_file = query.first()
+
+    if user_file is None:
+        return jsonify({'error': 'Data not found'}), 404
+
+    print(user_file)
+
+    file_data = {
+        'id': user_file.id,
+        'file_name': user_file.file_name,
+        'file_id': user_file.file_id,
+        'flow_type': user_file.flow_type,
+        'race_season': user_file.race_season,
+        'car_name': user_file.car_name,
+        'car_model': user_file.car_model,
+        'json_data': user_file.json_data,
+        'created_at': user_file.created_at,
+        'updated_at': user_file.updated_at
+    }
+
+    return jsonify(file_data), 200
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5555, debug=True)
