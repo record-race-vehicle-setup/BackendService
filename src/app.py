@@ -112,7 +112,7 @@ def request_reset_password():
     token = serializer.dumps(email, salt='password-reset-salt')
     # reset_link = url_for('reset_password', token=token, _external=True)
     
-    custom_base_url = "http://localhost:4200"
+    custom_base_url = "http://localhost:3000"
     relative_reset_link = url_for('reset_password', token=token)
     reset_link = f"{custom_base_url}{relative_reset_link}"
 
@@ -123,7 +123,7 @@ def request_reset_password():
     
     return jsonify({'message': 'Password reset link sent to your email.'}), 200
 
-@app.route('/reset/pwd/<token>', methods=['POST'])
+@app.route('/reset-password/<token>', methods=['POST'])
 def reset_password(token):
     try:
         email = serializer.loads(token, salt='password-reset-salt', max_age=3600)
