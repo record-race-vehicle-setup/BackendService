@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, url_for
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -8,6 +8,10 @@ from flask_cors import CORS
 import boto3
 import base64
 import json
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 
 app = Flask(__name__)
 # app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://root:root@localhost:3306/userdb'
@@ -15,6 +19,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///userdb.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = 'MY_SECRET_KEY'
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = 7200
+serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
 
 CORS(app, resources={r"/*": {"origins": "http://localhost:3000", "methods": ["GET", "POST", "DELETE"]}})
 
@@ -88,9 +93,65 @@ def login():
     user = User.query.filter_by(email=email).first()
     if user and check_password_hash(user.password, password):
         access_token = create_access_token(identity={'userId': user.id})
-        return jsonify(access_token=access_token), 200
+        return jsonify({
+            "access_token": access_token, 
+            "userName": "User" if user.name is None or user.name == "" else user.name
+        }), 200
 
     return jsonify({"msg": "Invalid email or password"}), 401
+
+@app.route('/reset/pwd/request', methods=['POST'])
+def request_reset_password():
+    email = request.json.get('email')
+    
+    user = User.query.filter_by(email=email).first()
+    
+    if not user or user is None:
+        return jsonify({'message': 'Invalid email'}), 404
+    
+    token = serializer.dumps(email, salt='password-reset-salt')
+    # reset_link = url_for('reset_password', token=token, _external=True)
+    
+    custom_base_url = "http://localhost:4200"
+    relative_reset_link = url_for('reset_password', token=token)
+    reset_link = f"{custom_base_url}{relative_reset_link}"
+
+    responseOfEmailSent = send_reset_email(email, reset_link)
+
+    if not responseOfEmailSent or responseOfEmailSent == "FAILURE":
+        return jsonify({'message': 'Failed to send password reset link'}), 500
+    
+    return jsonify({'message': 'Password reset link sent to your email.'}), 200
+
+@app.route('/reset/pwd/<token>', methods=['POST'])
+def reset_password(token):
+    try:
+        email = serializer.loads(token, salt='password-reset-salt', max_age=3600)
+        new_password = request.json.get('password')
+        
+        if not new_password:
+            return jsonify({'message': 'Password is required.'}), 400
+        
+        user = User.query.filter_by(email=email).first()
+        
+        if not user or user is None:
+            return jsonify({'message': 'User not found'}), 404
+        
+        hashed_password = generate_password_hash(new_password, method='pbkdf2:sha256')
+        user.password = hashed_password
+        db.session.commit()
+
+        return jsonify({'message': 'Your password has been updated successfully.'}), 200
+
+
+    except SignatureExpired:
+        return jsonify({'message': 'The token has expired.'}), 400
+    except BadSignature:
+        return jsonify({'message': 'Invalid token.'}), 400
+    except Exception as e:
+        print(str(e))
+        return jsonify({'message': str(e)}), 500
+
 
 @app.route('/presign/url', methods=['POST'])
 @jwt_required()
@@ -254,6 +315,32 @@ def getRace(raceId):
     }
 
     return jsonify(file_data), 200
+
+
+def send_reset_email(email, reset_link):
+    smtp_server = 'smtp.gmail.com'
+    smtp_port = 587
+    smtp_user = 'race.vehicles.setup@gmail.com'
+    smtp_password = 'stob rgcz whuo glzv'
+
+    msg = MIMEMultipart()
+    msg['From'] = smtp_user
+    msg['To'] = email
+    msg['Subject'] = 'Password Reset Request'
+    
+    body = f'Hi, \n\nClick the link below to reset your password:\n{reset_link}\n\nBest regards,\nRace Vehicle Team'
+    msg.attach(MIMEText(body, 'plain'))
+    
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_password)
+        server.sendmail(smtp_user, email, msg.as_string())
+        server.quit()
+        return "SUCCESS"
+    except Exception as e:
+        print(str(e))
+        return "FAILURE"
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5555, debug=True)
