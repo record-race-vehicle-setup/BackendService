@@ -52,6 +52,7 @@ class UserFile(db.Model):
     userId = db.Column(db.Integer, nullable=False)
     file_name = db.Column(db.String(256), nullable=True)
     file_id = db.Column(db.String(256), nullable=True)
+    file_size = db.Column(db.Integer, nullable=True)
     flow_type = db.Column(db.String(256), nullable=True)
     race_season = db.Column(db.String(256), nullable=False)
     car_name = db.Column(db.String(256), nullable=True)
@@ -220,10 +221,10 @@ def listBuckets():
                 Bucket='race-vehicle-file',
                 Key=base64.b64encode(str(current_user['userId']).encode('utf-8')).decode('utf-8') + '/' + fileName,
                 VersionId=fileId
-            )    
+            )
 
             data = json.loads(response['Body'].read().decode('utf-8'))
-            new_user_file = UserFile(userId=current_user['userId'], file_name=fileName, file_id=fileId, flow_type=flowType, race_season=raceSeason, car_name=carName, car_model=carModel, json_data=data)
+            new_user_file = UserFile(userId=current_user['userId'], file_name=fileName, file_id=fileId, file_size=response['ContentLength'], flow_type=flowType, race_season=raceSeason, car_name=carName, car_model=carModel, json_data=data)
             db.session.add(new_user_file)
             db.session.commit()
             
@@ -251,7 +252,7 @@ def getAllRaces():
     current_user = get_jwt_identity()
     
     query = UserFile.query.with_entities(
-        UserFile.id, UserFile.userId, UserFile.file_name, UserFile.file_id, 
+        UserFile.id, UserFile.userId, UserFile.file_name, UserFile.file_id, UserFile.file_size,
         UserFile.flow_type, UserFile.race_season, 
         UserFile.car_name, UserFile.car_model,
         UserFile.created_at, UserFile.updated_at
@@ -268,6 +269,7 @@ def getAllRaces():
             'userId': file.userId,
             'file_name': file.file_name,
             'file_id': file.file_id,
+            'file_size': file.file_size,
             'flow_type': file.flow_type,
             'race_season': file.race_season,
             'car_name': file.car_name,
@@ -284,7 +286,7 @@ def getRace(raceId):
     current_user = get_jwt_identity()
 
     query = UserFile.query.with_entities(
-        UserFile.id, UserFile.userId, UserFile.file_name, UserFile.file_id, 
+        UserFile.id, UserFile.userId, UserFile.file_name, UserFile.file_id, UserFile.file_size,
         UserFile.flow_type, UserFile.race_season, 
         UserFile.car_name, UserFile.car_model, UserFile.json_data,
         UserFile.created_at, UserFile.updated_at
@@ -299,12 +301,12 @@ def getRace(raceId):
     if user_file is None:
         return jsonify({'error': 'Data not found'}), 404
 
-    print(user_file)
-
     file_data = {
         'id': user_file.id,
+        'userId': user_file.userId,
         'file_name': user_file.file_name,
         'file_id': user_file.file_id,
+        'file_size': user_file.file_size,
         'flow_type': user_file.flow_type,
         'race_season': user_file.race_season,
         'car_name': user_file.car_name,
@@ -315,6 +317,43 @@ def getRace(raceId):
     }
 
     return jsonify(file_data), 200
+
+@app.route('/edit/race/<int:raceId>', methods=['POST'])
+@jwt_required()
+def editRace(raceId):
+    current_user = get_jwt_identity()
+    currentUserId = current_user['userId']
+
+    newJsonData = request.json.get('jsonData')
+
+    if newJsonData is None:
+        return jsonify({"msg": "New JSON data is required"}), 400
+
+
+    if not isinstance(newJsonData, dict):
+        return jsonify({"msg": "New JSON data must be a dictionary"}), 400
+
+    query = UserFile.query
+
+    if not raceId:
+        return jsonify({"msg": "Race ID is required"}), 400
+    
+    query = query.filter(UserFile.id == raceId).filter(UserFile.userId == current_user['userId'])
+    user_file = query.first()
+
+    if user_file is None:
+        return jsonify({'error': 'Data not found'}), 404
+
+    json_string = json.dumps(newJsonData)
+    file_size = len(json_string.encode('utf-8'))
+
+    if hasattr(user_file, 'file_size') and user_file.file_size is not None:
+        user_file.file_size = file_size
+
+    user_file.json_data = newJsonData
+    db.session.commit()
+
+    return jsonify({"msg": "Data updated successfully"}), 200
 
 
 def send_reset_email(email, reset_link):
